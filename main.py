@@ -7,9 +7,79 @@ from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 from models.blip import blip_feature_extractor
 from models.blip_itm import blip_itm
+import pika, os, logging, time
+from models import ImageSQL
+
+logging.basicConfig()
+connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))  # Connect to CloudAMQP
+channel = connection.channel()  # start a channel
+channel.queue_declare(queue='CaptionGen', durable=True)  # Declare a queue
+
+connection3 = pika.BlockingConnection(
+        pika.ConnectionParameters(host='localhost'))
+channel3 = connection3.channel()
+channel3.queue_declare(queue='AnswerGen', durable=True)
+
+
+def captionGen(imageID):
+    connection2 = pika.BlockingConnection(
+        pika.ConnectionParameters(host='localhost'))
+    channel2 = connection2.channel()
+    channel2.queue_declare(queue='QuestGen', durable=True)
+
+    channel2.basic_publish(
+        exchange='',  # This publishes the thing to a default exchange
+        routing_key='QuestGen',
+        body=imageID,
+        properties=pika.BasicProperties(
+            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+        ))
+    connection2.close()
+
+
+# def visualQuestionAnswer(ch, method, properties, body):
+#     connection3 = pika.BlockingConnection(
+#         pika.ConnectionParameters(host='localhost'))
+#     channel3 = connection3.channel()
+#     channel3.queue_declare(queue='AnswerGen', durable=True)
+#
+#     message = body.decode() + ' received'
+#     channel3.basic_publish(
+#         exchange='',  # This publishes the thing to a default exchange
+#         routing_key='AnswerGen',
+#         body=message,
+#         properties=pika.BasicProperties(
+#             delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+#         ))
+#     connection3.close()
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def callback(ch, method, properties, body):
+    image_size = 384
+    ID = body.decode()
+    image = ImageSQL.findById(ID)
+    image_url = image[1]
+
+    model_url = 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base_capfilt_large.pth'
+
+    model = blip_decoder(pretrained=model_url, image_size=image_size, vit='base')
+    model.eval()
+    model = model.to(device)
+
+    with torch.no_grad():
+        # beam search
+        caption = model.generate(image_url, sample=False, num_beams=3, max_length=20, min_length=5)
+        # nucleus sampling
+        # caption = model.generate(image, sample=True, top_p=0.9, max_length=20, min_length=5)
+        image_id = ImageSQL.getImageID(image[0])
+        ImageSQL.updatecaption(image_id, caption)
+        captionGen(image_id)
+        # print('caption: ' + caption[0])
+
+channel.basic_qos(prefetch_count=1)
+channel.basic_consume(queue='CaptionGen', on_message_callback=callback)
 
 def load_demo_image(image_size, device):
     img_url = 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/demo.jpg'
